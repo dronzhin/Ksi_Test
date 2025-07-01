@@ -1,7 +1,7 @@
 import pandas as pd
 import networkx as nx
 import os
-from fill_passes import DATA_DIR, load_bulls, load_cows, load_pedigree
+from save_load_csv import DATA_DIR, load_bulls, load_cows, load_pedigree
 from tqdm import tqdm
 from itertools import product
 
