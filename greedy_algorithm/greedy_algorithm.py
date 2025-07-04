@@ -1,5 +1,5 @@
 import pandas as pd
-from data.save_load_csv import load_cows, load_bulls, load_pairs_results, DATA_DIR, save_csv
+from data.save_load_csv import load_cows, load_bulls, load_pairs_results, save_csv
 
 # Загрузка данных
 pairs = load_pairs_results() # Все пары
