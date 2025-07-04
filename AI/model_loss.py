@@ -2,97 +2,115 @@ from data.save_load_csv import load_cows, load_bulls, load_pairs_results, save_c
 import torch
 import torch.nn.functional as F
 import numpy as np
-from collections import Counter
+import pickle
 
-def model_loss(tensor: torch.Tensor, base_penalty: float=3000, loss_enbreeding: float = 1000, loss_overuse: float = 1000, info: bool = False) -> float:
+def differentiable_loss(logits: torch.Tensor,
+                        existing_pairs_mask: torch.Tensor,
+                        avg_ebv_matrix: torch.Tensor,
+                        diff_ebv_matrix: torch.Tensor,
+                        num_cows: int,
+                        loss_enbreeding: float = 1000,
+                        loss_overuse: float = 1000,
+                        base_penalty: float = 3000,
+                        usage_threshold_ratio: float = 0.1,
+                        info: bool = False):
     """
-    Возвращает штраф за:
-    - новые пары (bull_id, cow_id), которых нет в истории
-    - избыточное использование одних и тех же быков (>10% от всех коров)
-    При этом:
-    - уменьшает штраф на среднее значение 'average_ebv' по найденным парам
+    Дифференцируемая версия функции model_loss для обучения модели.
 
     Параметры:
-        tensor (torch.Tensor): Тензор размером [N, M], где N — число коров, M — число быков
-        loss_enbreeding (float): Штраф за каждую новую пару
-        loss_overuse (float): Штраф за каждую **лишнюю** корову на перегруженного быка
+        logits (torch.Tensor): [N_cows, N_bulls] — выход модели (логиты)
+        existing_pairs_mask (torch.Tensor): бинарная матрица размера [N_cows, N_bulls], где 1 — новая пара
+        avg_ebv_matrix (torch.Tensor): матрица средних EBV для пар [N_cows, N_bulls]
+        num_cows (int): количество коров
+        остальные параметры аналогичны оригиналу
 
     Возвращает:
-        float: Общий штраф (с учётом качества найденных пар)
+        torch.Tensor: скалярный loss
     """
+    probs = F.softmax(logits, dim=1)
 
-    # Загрузка данных
-    pairs = load_pairs_results()
-    cows_df = load_cows()
-    bulls_df = load_bulls()
+    # Штраф за новые пары (взвешиваем вероятности на маску новых пар)
+    enbreeding_penalty = (probs * existing_pairs_mask).sum() * loss_enbreeding
 
-    # Преобразуем в массивы numpy для эффективного доступа
-    cows = cows_df['id'].values
-    bulls = bulls_df['id'].values
+    # Штраф за перегрузку быков: сумма превышения порога
+    usage_threshold = usage_threshold_ratio * num_cows
+    bull_usage = probs.sum(dim=0)  # [N_bulls]
+    overuse_penalty = torch.relu(bull_usage - usage_threshold).sum() * loss_overuse
 
-    # Создаём словарь для быстрого поиска значения average_ebv и difference_ebv по паре
-    pair_average = dict(zip(zip(pairs['bull_id'], pairs['cow_id']), pairs['average_ebv']))
-    pair_difference = dict(zip(zip(pairs['bull_id'], pairs['cow_id']), pairs['difference_ebv']))
+    # Награда за качество найденных пар (мы минимизируем loss => награда вычитается)
+    avg_ebv_reward = (probs * avg_ebv_matrix).sum()/num_cows
+    diff_ebv_reward = (probs * diff_ebv_matrix).sum() / num_cows
 
-    existing_pairs = set(zip(pairs['bull_id'], pairs['cow_id']))
-
-    # Получаем предсказанные индексы быков
-    out_model = tensor.argmax(dim=1).cpu().numpy()
-
-    # Превращаем в bull_id
-    predicted_bull_ids = bulls[out_model]
-
-    # Формируем пары и считаем пропущенные + собираем quality
-    predicted_pairs = list(zip(predicted_bull_ids, cows))
-
-    missing_count = 0
-    found_pair_average = []
-    found_pair_difference = []
-
-    for pair in predicted_pairs:
-        if pair not in existing_pairs:
-            missing_count += 1
-        else:
-            # Если пара существует — сохраняем её качество
-            found_pair_average.append(pair_average[pair])
-            found_pair_difference.append(pair_difference[pair])
-
-    enbreeding_penalty = loss_enbreeding * missing_count
-
-    # Считаем, сколько раз используется каждый бык
-    bull_usage = Counter(predicted_bull_ids)
-
-    # Порог: 10% от общего числа коров
-    usage_threshold = 0.1 * len(cows)
-
-    # Считаем общее **превышение** порога по всем быкам
-    overused_extra_cows = sum(max(count - usage_threshold, 0) for bull, count in bull_usage.items())
-
-    # Штраф за избыток (только на лишние коровы)
-    overuse_penalty = loss_overuse * overused_extra_cows
-
-    # Учёт качества найденных пар
-    avg_average = np.mean(found_pair_average) if found_pair_average else 0.0
-    avg_difference = np.mean(found_pair_difference) if found_pair_difference else 0.0
-
-    # Общий штраф с поправкой на качество
-    total_penalty = base_penalty + enbreeding_penalty + overuse_penalty - avg_average - avg_difference
+    # Общий loss
+    total_loss = base_penalty + enbreeding_penalty + overuse_penalty - avg_ebv_reward - diff_ebv_reward
 
     if info:
-        print(f"Enbreeding penalty: {enbreeding_penalty}")
-        print(f"Overuse penalty: {overuse_penalty}")
-        print(f"Avg EBV of found pairs: {avg_average}")
-        print(f"Difference EBV of found pairs: {avg_difference}")
-        print(f"Total penalty: {total_penalty}")
+        print(f"Enbreeding penalty: {enbreeding_penalty.item()}")
+        print(f"Overuse penalty: {overuse_penalty.item()}")
+        print(f"Avg_ebv reward (avg_ebv): {avg_ebv_reward.item()}")
+        print(f"Diff_ebv reward (avg_ebv): {diff_ebv_reward.item()}")
+        print(f"Total loss: {total_loss.item()}")
 
-    return total_penalty
+    return total_loss
 
 if __name__ == '__main__':
+
+    # # Загрузка данных
+    # pairs = load_pairs_results()
+    # cows_df = load_cows()
+    # bulls_df = load_bulls()
+    #
+    # # Предположим, у нас есть bulls и cows как списки ID
+    # bull_ids = bulls_df['id'].values
+    # cow_ids = cows_df['id'].values
+    #
+    # # Создаём матрицу EBV и маску новых пар
+    # avg_ebv_tensor = torch.zeros(len(cow_ids), len(bull_ids))
+    # diff_ebv_tensor = torch.zeros(len(cow_ids), len(bull_ids))
+    #
+    # existing_pairs_mask = torch.ones(len(cow_ids), len(bull_ids))  # 1 — новая пара, 0 — существующая
+    #
+    # for _, row in pairs.iterrows():
+    #     bull_idx = np.where(bull_ids == row['bull_id'])[0][0]
+    #     cow_idx = np.where(cow_ids == row['cow_id'])[0][0]
+    #     avg_ebv_tensor[cow_idx, bull_idx] = row['average_ebv']
+    #     diff_ebv_tensor[cow_idx, bull_idx] = row['difference_ebv']
+    #
+    #     existing_pairs_mask[cow_idx, bull_idx] = 0  # существующая пара — нет штрафа
+    #
+    #
+    # data = {
+    #     'existing_pairs_mask': existing_pairs_mask,
+    #     'avg_ebv_tensor': avg_ebv_tensor,
+    #     'diff_ebv_tensor': diff_ebv_tensor,
+    #     'num_cows': len(cow_ids)
+    # }
+    #
+    # with open('loss_params.pickle', 'wb') as f:
+    #     pickle.dump(data, f)
+
+    with open('loss_params.pickle', 'rb') as f:
+        data_out = pickle.load(f)
+
+    existing_pairs_mask = data_out['existing_pairs_mask']
+    avg_ebv_tensor = data_out['avg_ebv_tensor']
+    diff_ebv_tensor = data_out["diff_ebv_tensor"]
+    num_cows = data_out['num_cows']
+
     # Создаем случайный тензор размером [4, 6]
-    logits = torch.randn(17000, 39)
+    logits = torch.randn(17177, 39)
 
-    # Применяем softmax по последней оси (по классам)
-    probabilities = F.softmax(logits, dim=1)
+    # # Применяем softmax по последней оси (по классам)
+    # probabilities = F.softmax(logits, dim=1)
+    # probabilities = probabilities.argmax(dim=1)
 
-    #print(probabilities)
-    print(model_loss(probabilities, info=True))
+    loss = differentiable_loss(
+                    logits=logits,
+                    existing_pairs_mask=existing_pairs_mask,
+                    avg_ebv_matrix=avg_ebv_tensor,
+                    diff_ebv_matrix=diff_ebv_tensor,
+                    num_cows=num_cows,
+                    info=True
+                )
+
+    print(loss)
