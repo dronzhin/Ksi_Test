@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import pickle
 
-def differentiable_loss(logits: torch.Tensor,
+def model_loss(logits: torch.Tensor,
                         existing_pairs_mask: torch.Tensor,
                         avg_ebv_matrix: torch.Tensor,
                         diff_ebv_matrix: torch.Tensor,
@@ -42,7 +42,7 @@ def differentiable_loss(logits: torch.Tensor,
     diff_ebv_reward = (probs * diff_ebv_matrix).sum() / num_cows
 
     # Общий loss
-    total_loss = base_penalty + enbreeding_penalty + overuse_penalty - avg_ebv_reward - diff_ebv_reward
+    total_loss = base_penalty + enbreeding_penalty + overuse_penalty - avg_ebv_reward*0.7 - diff_ebv_reward*0.3
 
     if info:
         print(f"Enbreeding penalty: {enbreeding_penalty.item()}")
@@ -91,20 +91,20 @@ if __name__ == '__main__':
 
     with open('loss_params.pickle', 'rb') as f:
         data_out = pickle.load(f)
+    # Загрузка данных
+    with open('data.pickle', 'rb') as f:
+        data = pickle.load(f)
 
     existing_pairs_mask = data_out['existing_pairs_mask']
     avg_ebv_tensor = data_out['avg_ebv_tensor']
     diff_ebv_tensor = data_out["diff_ebv_tensor"]
     num_cows = data_out['num_cows']
 
-    # Создаем случайный тензор размером [4, 6]
-    logits = torch.randn(17177, 39)
-
     # # Применяем softmax по последней оси (по классам)
     # probabilities = F.softmax(logits, dim=1)
     # probabilities = probabilities.argmax(dim=1)
 
-    loss = differentiable_loss(
+    loss = model_loss(
                     logits=logits,
                     existing_pairs_mask=existing_pairs_mask,
                     avg_ebv_matrix=avg_ebv_tensor,
